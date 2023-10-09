@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -16,6 +17,9 @@ ROOT = FILE.parents[1]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 # ROOT = ROOT.relative_to(Path.cwd())  # relative
+
+import torch
+
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
@@ -424,26 +428,58 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in [DCoT, CoT, Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, SPPCSPC, RepConv]:
+                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, SPPCSPC, RepConv, nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
+                 SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
+                 Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
+                 RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  
+                 Res, ResCSPA, ResCSPB, ResCSPC, 
+                 RepRes, RepResCSPA, RepResCSPB, RepResCSPC, 
+                 ResX, ResXCSPA, ResXCSPB, ResXCSPC, 
+                 RepResX, RepResXCSPA, RepResXCSPB, RepResXCSPC, 
+                 Ghost, GhostCSPA, GhostCSPB, GhostCSPC, BoT3, CA, CBAM,C3C2,NAMAttention, GAMAttention,
+                 SwinTransformerBlock, STCSPA, STCSPB, STCSPC,C3STR,C3HB,CNeB,HorBlock,ASPP,BasicRFB, SPPCSPC_group,
+                 SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC]:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [DCoT, BottleneckCSP, C3, C3TR, C3Ghost, SPPCSPC]:
+            if m in [DCoT, BottleneckCSP, C3, C3TR, C3Ghost, SPPCSPC, DownC, SPPCSPC, GhostSPPCSPC, 
+                     BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
+                     RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC, 
+                     ResCSPA, ResCSPB, ResCSPC, 
+                     RepResCSPA, RepResCSPB, RepResCSPC, 
+                     ResXCSPA, ResXCSPB, ResXCSPC, 
+                     RepResXCSPA, RepResXCSPB, RepResXCSPC,
+                     GhostCSPA, GhostCSPB, GhostCSPC,BoT3,C3C2,
+                     STCSPA, STCSPB, STCSPC,C3STR,C3HB,CNeB,HorBlock,
+                     ST2CSPA, ST2CSPB, ST2CSPC]:
                 args.insert(2, n)  # number of repeats
                 n = 1
             elif m is nn.ConvTranspose2d:
                 if len(args) >= 7:
                     args[6] = make_divisible(args[6] * gw, 8)
+        elif m in [ CrissCrossAttention, SOCA, SEAttention, SimAM, SKAttention]:
+            c1, c2 = ch[f], args[0]
+            if c2 != no:  # if not output
+                c2 = make_divisible(c2 * gw, 8)
+            args = [c1, *args[1:]]
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
-            c2 = sum(ch[x] for x in f)
-        elif m in [Detect, IDetect]:
+            c2 = sum([ch[x] for x in f])
+        elif m is Chuncat:
+            c2 = sum([ch[x] for x in f])
+        elif m is Shortcut:
+            c2 = ch[f[0]]
+        elif m is Foldcut:
+            c2 = ch[f] // 2
+        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint,ASFF_Detect,Decoupled_Detect]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
+        elif m is ReOrg:
+            c2 = ch[f] * 4
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
