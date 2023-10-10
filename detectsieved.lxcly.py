@@ -50,6 +50,7 @@ def detect(save_img=False):
 
     # Set Dataloader
     vid_path, vid_writer = None, None
+    nclz = opt.nclz
     if webcam:
         view_img = check_imshow()
         cudnn.benchmark = True  # set True to speed up constant image size inference
@@ -120,6 +121,11 @@ def detect(save_img=False):
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
+                # Sieve results, added on 2023.07.17
+                det = sievealg(det, nclz) #calls the sieving algorithm
+                print('after sieving, the det2.size is:')
+                print(det2.size())
+                    
                 # Write results
                 for *poly, conf, cls in reversed(det):
                     if save_txt:  # Write to file
@@ -174,6 +180,7 @@ if __name__ == '__main__':
     parser.add_argument('--weights', nargs='+', type=str, default='runs/train/exp/weights/best.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='D:\\Projects\\XiGuangSuo\\yolov5_obb\\dataset\\Ship_dota_v1.5_1024\\val\\images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=1024, help='inference size (pixels)')
+    parser.add_argument('--nclz', type=int, default=4, help='max number of classes in the dataset')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
