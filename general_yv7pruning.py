@@ -1,6 +1,6 @@
+# -*- coding: utf-8 -*-
 # YOLOR general utils
 
-import copy
 import glob
 import logging
 import math
@@ -11,6 +11,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -18,14 +19,14 @@ import pandas as pd
 import torch
 import torchvision
 import yaml
-from copy import deepcopy
+from torch import Tensor
 
-from utils.google_utils import gsutil_getsize
-from utils.metrics import fitness
-from utils.torch_utils import init_torch_seeds, time_synchronized
-import numpy as np
-from shapely.geometry import Polygon, MultiPoint
-from mmcv.ops import nms_rotated
+from yolov7obb.utils.google_utils import gsutil_getsize
+from yolov7obb.utils.metrics import fitness
+from yolov7obb.utils.torch_utils import init_torch_seeds
+from yolov7obb.utils.nms_rotated import obb_nms
+
+pi = 3.141592
 
 # Settings
 torch.set_printoptions(linewidth=320, precision=5, profile='long')
@@ -33,118 +34,6 @@ np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format}) 
 pd.options.display.max_columns = 10
 cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
 os.environ['NUMEXPR_MAX_THREADS'] = str(min(os.cpu_count(), 8))  # NumExpr max threads
-
-
-def rotate_iou(box1, box2, GIoU=False):
-    """
-    :param box1: GT
-    :param box2: anchor
-    :param GIoU:
-    :return: iou
-    """
-    ft = torch.cuda.FloatTensor
-    if isinstance(box1, list):  box1 = ft(box1)
-    if isinstance(box2, list):  box2 = ft(box2)
-    # print(box1)
-    # print(box2)
-    if len(box1.shape) < len(box2.shape):
-        box1 = box1.unsqueeze(0)
-    if not box1.shape == box2.shape:
-        box1 = box1.repeat(len(box2), 1)
-    # print(box1)
-    box1 = box1[:, :5]
-    box2 = box2[:, :5]
-
-    if GIoU:
-        mode = 'giou'
-    else:
-        mode = 'iou'
-
-    ious = []
-    for i in range(len(box2)):
-        # print(i)
-        r_b1 = get_rotated_coors(box1[i])
-        r_b2 = get_rotated_coors(box2[i])
-
-        ious.append(skewiou(r_b1, r_b2, mode=mode))
-
-    # if GIoU:  # Generalized IoU https://arxiv.org/pdf/1902.09630.pdf
-    #     c_x1, c_x2 = torch.min(b1_x1, b2_x1), torch.max(b1_x2, b2_x2)
-    #     c_y1, c_y2 = torch.min(b1_y1, b2_y1), torch.max(b1_y2, b2_y2)
-    #     c_area = (c_x2 - c_x1) * (c_y2 - c_y1)  # convex area
-    #     return iou - (c_area - union_area) / c_area  # GIoU
-    # print(ious)
-    return ft(ious)
-
-
-def get_rotated_coors(box):
-    assert len(box) > 0 , 'Input valid box!'
-    cx = box[0]; cy = box[1]; w = box[2]; h = box[3]; a = box[4]
-    xmin = cx - w*0.5; xmax = cx + w*0.5; ymin = cy - h*0.5; ymax = cy + h*0.5
-
-    t_x0=int(xmin); t_y0=int(ymin); t_x1=int(xmin); t_y1=int(ymax);
-    t_x2=int(xmax); t_y2=int(ymax); t_x3=int(xmax); t_y3=int(ymin);
-    R = np.eye(3)
-    R[:2] = cv2.getRotationMatrix2D(angle=float(-a), center=(int(cx),int(cy)), scale=1)
-    x0 = t_x0*R[0,0] + t_y0*R[0,1] + R[0,2]
-    y0 = t_x0*R[1,0] + t_y0*R[1,1] + R[1,2]
-    x1 = t_x1*R[0,0] + t_y1*R[0,1] + R[0,2]
-    y1 = t_x1*R[1,0] + t_y1*R[1,1] + R[1,2]
-    x2 = t_x2*R[0,0] + t_y2*R[0,1] + R[0,2]
-    y2 = t_x2*R[1,0] + t_y2*R[1,1] + R[1,2]
-    x3 = t_x3*R[0,0] + t_y3*R[0,1] + R[0,2]
-    y3 = t_x3*R[1,0] + t_y3*R[1,1] + R[1,2]
-
-    # x0, y0, x1, y1 = iou_bound(x0, y0, x1, y1, img_shape)  # boundary
-    # x2, y2, x3, y3 = iou_bound(x2, y2, x3, y3, img_shape)
-    # x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
-    # x2, y2, x3, y3 = int(x2), int(y2), int(x3), int(y3)
-
-    if isinstance(x0,torch.Tensor):
-        r_box=torch.cat([x0.unsqueeze(0),y0.unsqueeze(0),
-                         x1.unsqueeze(0),y1.unsqueeze(0),
-                         x2.unsqueeze(0),y2.unsqueeze(0),
-                         x3.unsqueeze(0),y3.unsqueeze(0)], 0)
-    else:
-        r_box = np.array([x0,y0,x1,y1,x2,y2,x3,y3])
-    return r_box
-
-def skewiou(box1, box2,mode='iou',return_coor = False):
-    a=box1.reshape(4, 2)
-    b=box2.reshape(4, 2)
-    poly1 = Polygon(a).convex_hull
-    poly2 = Polygon(b).convex_hull
-    if not poly1.is_valid or not poly2.is_valid:
-        print('formatting errors for boxes!!!! ')
-        return 0
-    if  poly1.area == 0 or  poly2.area  == 0 :
-        return 0
-
-    inter = Polygon(poly1).intersection(Polygon(poly2)).area
-    if   mode == 'iou':
-        union = poly1.area + poly2.area - inter
-    elif mode =='tiou':
-        union_poly = np.concatenate((a,b))
-        union = MultiPoint(union_poly).convex_hull.area
-        coors = MultiPoint(union_poly).convex_hull.wkt
-    elif mode == 'giou':
-        union_poly = np.concatenate((a,b))
-        union = MultiPoint(union_poly).envelope.area
-        coors = MultiPoint(union_poly).envelope.wkt
-    elif mode == 'r_giou':
-        union_poly = np.concatenate((a,b))
-        union = MultiPoint(union_poly).minimum_rotated_rectangle.area
-        coors = MultiPoint(union_poly).minimum_rotated_rectangle.wkt
-    else:
-        print('incorrect mode!')
-
-    if union == 0:
-        return 0
-    else:
-        if return_coor:
-            return inter/union,coors
-        else:
-            return inter/union
 
 
 def set_logging(rank=-1):
@@ -171,9 +60,9 @@ def isdocker():
     return Path('/workspace').exists()  # or Path('/.dockerenv').exists()
 
 
-def emojis(str=''):
+def emojis(str_val=''):
     # Return platform-dependent emoji-safe version of string
-    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
+    return str_val.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str_val
 
 
 def check_online():
@@ -237,13 +126,41 @@ def check_requirements(requirements='requirements.txt', exclude=()):
         print(emojis(s))  # emoji-safe
 
 
-def check_img_size(img_size, s=32):
+# +
+#Admin's original, used in the training mode
+def check_img_size(img_size: Tuple[int, int], s=32):
     # Verify img_size is a multiple of stride s
-    new_size = make_divisible(img_size, int(s))  # ceil gs-multiple
+    new_size = int(map(lambda x: make_divisible(x, int(s)), img_size))  # ceil gs-multiple
     if new_size != img_size:
         print('WARNING: --img-size %g must be multiple of max stride %g, updating to %g' % (img_size, s, new_size))
     return new_size
 
+#our updates, demi-universal
+def check_img_size_demi(img_size: Tuple[int, int], s=32):
+    # Verify img_size is a multiple of stride s
+    new_size = tuple(map(lambda x: make_divisible(x, int(s)), img_size))  # ceil gs-multiple
+    if new_size != img_size:
+        print(f'WARNING: --img-size {img_size} must be multiple of max stride {s}, updating to {new_size}')
+    return new_size
+
+#our updates, used in the detection/predicion mode
+def check_img_size(img_size, s=32):
+    import math
+    if isinstance(img_size, tuple):
+        new_size = tuple(make_divisible(x, int(s)) for x in img_size)
+        if new_size != img_size:
+            print(f'WARNING: --img-size {img_size} must be multiple of max stride {s}, updating to {new_size}')
+        return new_size
+    elif isinstance(img_size, int):
+        new_size = make_divisible(img_size, int(s))
+        if new_size != img_size:
+            print(f'WARNING: --img-size {img_size} must be multiple of max stride {s}, updating to {new_size}')
+        return new_size
+    else:
+        raise TypeError(f"img_size must be either tuple or int, not {type(img_size)}")
+
+
+# -
 
 def check_imshow():
     # Check if environment supports image displays
@@ -261,6 +178,7 @@ def check_imshow():
 
 def check_file(file):
     # Search for file if not found
+    print("file=",  file)
     if Path(file).is_file() or file == '':
         return file
     else:
@@ -300,6 +218,10 @@ def clean_str(s):
     return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨´><+]", repl="_", string=s)
 
 
+def linear(epochs, lr_final):
+    return lambda x: (1 - x / (epochs - 1)) * (1.0 - lr_final) + lr_final  # linear
+
+
 def one_cycle(y1=0.0, y2=1.0, steps=100):
     # lambda function for sinusoidal ramp from y1 to y2
     return lambda x: ((1 - math.cos(x * math.pi / steps)) / 2) * (y2 - y1) + y1
@@ -336,7 +258,7 @@ def labels_to_class_weights(labels, nc=80):
         return torch.Tensor()
 
     labels = np.concatenate(labels, 0)  # labels.shape = (866643, 5) for COCO
-    classes = labels[:, 0].astype(np.int32)  # labels = [class xywh]
+    classes = labels[:, 0].astype(np.int)  # labels = [class xywh]
     weights = np.bincount(classes, minlength=nc)  # occurrences per class
 
     # Prepend gridpoint count (for uCE training)
@@ -349,10 +271,10 @@ def labels_to_class_weights(labels, nc=80):
     return torch.from_numpy(weights)
 
 
-def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
+def labels_to_image_weights(labels, classes_number=80, class_weights=np.ones(80)):
     # Produces image weights based on class_weights and image contents
-    class_counts = np.array([np.bincount(x[:, 0].astype(np.int32), minlength=nc) for x in labels])
-    image_weights = (class_weights.reshape(1, nc) * class_counts).sum(1)
+    class_counts = np.array([np.bincount(x[:, 0].astype(np.int), minlength=classes_number) for x in labels])
+    image_weights = (class_weights.reshape(1, classes_number) * class_counts).sum(1)
     # index = random.choices(range(n), weights=image_weights, k=1)  # weight image sample
     return image_weights
 
@@ -427,7 +349,6 @@ def segments2boxes(segments):
 def resample_segments(segments, n=1000):
     # Up-sample an (n,2) segment
     for i, s in enumerate(segments):
-        s = np.concatenate((s, s[0:1, :]), axis=0)
         x = np.linspace(0, len(s) - 1, n)
         xp = np.arange(len(s))
         segments[i] = np.concatenate([np.interp(x, xp, s[:, i]) for i in range(2)]).reshape(2, -1).T  # segment xy
@@ -449,6 +370,22 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     clip_coords(coords, img0_shape)
     return coords
 
+# gwang add
+def scale_polys(img1_shape, polys, img0_shape, ratio_pad=None):
+    # ratio_pad: [(h_raw, w_raw), (hw_ratios, wh_paddings)]
+    # Rescale coords (xyxyxyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = resized / raw
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    else:
+        gain = ratio_pad[0][0] # h_ratios
+        pad = ratio_pad[1] # wh_paddings
+
+    polys[:, [0, 2, 4, 6]] -= pad[0]  # x padding
+    polys[:, [1, 3, 5, 7]] -= pad[1]  # y padding
+    polys[:, :8] /= gain # Rescale poly shape to img0_shape
+    #clip_polys(polys, img0_shape)
+    return polys
 
 def clip_coords(boxes, img_shape):
     # Clip bounding xyxy bounding boxes to image shape (height, width)
@@ -721,107 +658,6 @@ def box_diou(box1, box2, eps: float = 1e-7):
     # distance between boxes' centers squared.
     return iou - (centers_distance_squared / diagonal_distance_squared)
 
-def non_max_suppression_obb(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False, labels=()):
-    # x, y, w, h, angle([0, 180)), conf, cls
-
-    nc = prediction[0].shape[1] - 6  # number of classes
-    xc = prediction[..., 5] > conf_thres  # candidates
-
-    # Settings
-    min_wh, max_wh = 2, 2048
-    max_det = 3000
-    max_nms = 30000
-    multi_label &= nc > 1  # multiple labels per box
-
-    t = time.time()
-    output = [torch.zeros((0, 7), device=prediction.device)] * prediction.shape[0]
-    for xi, x in enumerate(prediction):
-        x = x[xc[xi]]
-
-        # If none remain process next image
-        if not x.shape[0]:
-            continue
-
-        # Compute conf
-        if nc == 1:
-            x[:, 6:] = x[:, 5:6]
-        else:
-            x[:, 6:] *= x[:, 5:6]  # conf = obj_conf * cls_conf
-
-        x[:, 4] = x[:, 4] * math.pi / 180 - math.pi / 2   # θ∈[-pi/2, pi/2)
-        box = x[:, :5]
-
-        if multi_label:
-            i, j = (x[:, 6:] > conf_thres).nonzero(as_tuple=False).T  # > conf_thres
-            x = torch.cat((box[i], x[i, j + 6, None], j[:, None].float()), 1)
-
-        else:  # best class only
-            conf, j = x[:, 6:].max(1, keepdim=True)
-            # _, j = x[:, 6:].max(1, keepdim=True)
-            # conf = x[:, 5].reshape(-1, 1)
-            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]  # xywh theta conf cls
-
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
-            continue
-        elif n > max_nms:  # excess boxes
-            x = x[x[:, 5].argsort(descending=True)[:max_nms]]  # sort by confidence
-
-        # Batched NMS
-        c = copy.deepcopy(x[:, 6]) * (0 if agnostic else max_wh)  # classes
-        boxes, scores = copy.deepcopy(x[:, :5]), copy.deepcopy(x[:, 5])  # boxes (offset by class), scores
-        boxes[:, :2] += c.view(-1, 1)
-
-        # (num, [cx cy w h θ]) θ∈[-pi/2, pi/2)
-        t_obb_nms_start = time_synchronized()
-        'Rotated NMS'
-
-        boxes[..., 4] = boxes[..., 4] + math.pi / 2  # [0, pi)
-        boxes[..., 4][boxes[..., 4] < math.pi / 2] = boxes[..., 4][boxes[..., 4] < math.pi / 2]
-        boxes[..., 4][boxes[..., 4] >= math.pi / 2] = boxes[..., 4][boxes[..., 4] >= math.pi / 2] - math.pi
-
-        _, i = nms_rotated(boxes, scores, iou_thres)
-        # t_nms_rotated = time_synchronized()
-        # print('t_nms_rotated: ', t_nms_rotated - t_obb_nms)
-
-        t_obb_nms_end = time_synchronized()
-        # print(f'({(1E3 * (t_obb_nms_end - t_obb_nms_start)):.1f}ms) obb_nms')
-
-        if i.shape[0] > max_det:  # limit detections
-            i = i[:max_det]
-
-        output[xi] = x[i]
-        # if (time.time() - t) > time_limit:
-        #     print(f'WARNING: NMS time limit {time_limit}s exceeded')
-        #     break  # time limit exceeded
-
-        # cls_all = x[:, 6:7].reshape(-1)
-        # i_nms = torch.zeros((1))
-        # for cls_index in range(nc):  # 16
-        #     boxes_index = x[:, :5][cls_all==cls_index]
-        #     if len(boxes_index) == 0:
-        #         continue
-        #     TF = (cls_all==cls_index).nonzero().reshape(-1).to("cpu")
-        #     scores_index = x[:, 5][cls_all==cls_index]
-        #
-        #     boxes_cpu = deepcopy(boxes_index).to("cpu")
-        #     scores_cpu = deepcopy(scores_index).to("cpu")
-        #     # i_index = nms(boxes_cpu, scores_cpu, img_shape)
-        #     _, i_index = obb_nms(boxes_cpu, scores_cpu, iou_thres)
-        #     i_nms = torch.cat((i_nms, TF[i_index]), dim=0)
-        # i = i_nms[1:].long().to(prediction.device)
-        #
-        # if i.shape[0] > max_det:  # limit detections
-        #     i = i[:max_det]
-        #
-        # output[xi] = x[i]
-        #
-        # if (time.time() - t) > time_limit:
-        #     break  # time limit exceeded
-
-    # x y w h angle(-pi/2~pi/2) conf cls
-    return output
 
 def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
                         labels=()):
@@ -900,7 +736,6 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
         i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
         if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
@@ -918,6 +753,118 @@ def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=Non
 
     return output
 
+# gwang add
+def non_max_suppression_obb(
+        prediction: Tensor,
+        conf_threshold: float = 0.25,
+        iou_thres: float = 0.45,
+        classes: List[int] = None,
+        agnostic: bool = False,
+        multi_label: bool = False,
+        labels=(),
+        max_det=1500
+):
+    """Runs Non-Maximum Suppression (NMS) on inference results_obb
+    Args:
+        prediction (tensor): (b, n_all_anchors, [cx cy l s obj num_cls theta_cls])
+        conf_threshold (float): Detections with a confident less than this will be rejected.
+        iou_thres (float): Intersection over union threshold for NMS
+        classes (List[int]): The list of classes that will be left after filtering.
+                             If None, then all classes will be left.
+        agnostic (bool): True = NMS will be applied between elements of different categories
+        multi_label: (bool): If true, then the box will have several classes whose confidence is greater  conf_threshold
+        labels : () or
+        max_det (int): Limits the number of detections used in the NMS
+
+    Returns:
+        list of detections, len=batch_size, on (n,7) tensor per image [xylsθ, conf, cls] θ ∈ [-pi/2, pi/2)
+    """
+    nc = prediction.shape[2] - 5 - 180  # number of classes
+    xc = prediction[..., 4] > conf_threshold  # candidates
+    class_index = nc + 5
+
+    # Checks
+    assert 0 <= conf_threshold <= 1, f'Invalid Confidence threshold {conf_threshold}, valid values are between 0.0 and 1.0'
+    assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
+
+    # Settings
+    max_wh = 4096 # min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+    time_limit = 30.0  # seconds to quit after
+    # redundant = True  # require redundant detections
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+    #
+    t = time.time()
+    output = [torch.zeros((0, 7), device=prediction.device)] * prediction.shape[0]
+
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        x = x[xc[xi]]  # confidence, (tensor): (n_conf_thres, [cx cy l s obj num_cls theta_cls])
+
+        # Cat apriori labels if autolabelling
+        if labels and len(labels[xi]):
+            l = labels[xi]
+            v = torch.zeros((len(l), nc + 5), device=x.device)
+            v[:, :4] = l[:, 1:5]  # box
+            v[:, 4] = 1.0  # conf
+            v[range(len(l)), l[:, 0].long() + 5] = 1.0  # cls
+            x = torch.cat((x, v), 0)
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+
+        # Compute conf
+        if nc:
+            conf_all_classes = x[:, 5:class_index] * x[:, 4:5]  # conf = obj_conf * cls_conf
+        else:
+            conf_all_classes = x[:, 4:5]  # conf = obj_conf * cls_conf
+        _, theta_pred = torch.max(x[:, class_index:], 1,  keepdim=True)  # [n_conf_thres, 1] θ ∈ int[0, 179]
+        theta_pred = (theta_pred-90) / 180 * pi  # [n_conf_thres, 1] θ ∈ [-pi/2, pi/2)
+
+        # Detections matrix nx7 (xyls, θ, conf, cls) θ ∈ [-pi/2, pi/2)
+        if multi_label:
+            i, j = (conf_all_classes > conf_threshold).nonzero(as_tuple=False).T
+            x = torch.cat((x[i, :4], theta_pred[i], x[i, j + 5, None], j[:, None].float()), 1)
+        else:  # best class only
+            conf, j = conf_all_classes.max(1, keepdim=True)
+            # print("conf class =", x[conf.view(-1) > conf_threshold, 5:class_index])
+            # print("obj class =", x[conf.view(-1) > conf_threshold, 4:5])
+            x = torch.cat((x[:, :4], theta_pred, conf, j.float()), 1)[conf.view(-1) > conf_threshold]
+
+        # Filter by class
+        if classes is not None:
+            x = x[(x[:, 6:7] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Apply finite constraint
+        if not torch.isfinite(x).all():
+            x = x[torch.isfinite(x).all(1)]
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            continue
+        elif n > max_nms:  # excess boxes
+            x = x[x[:, 5].argsort(descending=True)[:max_nms]]  # sort by confidence
+
+        # Batched NMS
+        c = x[:, 6:7] * (0 if agnostic else max_wh)  # classes
+        rboxes = x[:, :5].clone()
+        rboxes[:, :2] = rboxes[:, :2] + c # rboxes (offset by class)
+        scores = x[:, 5]  # scores
+        _, i = obb_nms(rboxes, scores, iou_thres)
+        if i.shape[0] > max_det:  # limit detections
+            i = i[:max_det]
+
+        output[xi] = x[i]
+        if (time.time() - t) > time_limit:
+            print(f'WARNING: NMS time limit {time_limit}s exceeded')
+            break  # time limit exceeded
+        # del x
+
+    return output
 
 def non_max_suppression_kpt(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
                         labels=(), kpt_label=False, nc=None, nkpt=None):
