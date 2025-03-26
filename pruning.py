@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch_pruning as tp
 import copy
-from models.yolo import Model
+from yolov7obb.models.yolo import Model
 from torch_pruning import MetaPruner
-from utils.torch_utils import intersect_dicts, is_parallel
+from yolov7obb.utils.torch_utils import intersect_dicts, is_parallel
 from yolov7obb.models.common import RepConv
 from yolov7obb.models.yolo import IDetect
 
@@ -84,11 +84,9 @@ def channel_prune(
         iterative_steps=400,
         ch_sparsity=1.0,
         ch_sparsity_dict=ch_sparsity_dict,
-        max_ch_sparsity=1,
         ignored_layers=ignored_layers,
         unwrapped_parameters=unwrapped_parameters,
         global_pruning=False,
-        model_ref=initial_model,
         round_to=round_to
     )
 
